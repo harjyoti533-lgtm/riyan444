@@ -12,25 +12,14 @@ import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
 import base64
-import os
 
 app = Flask(__name__)
 
-# --- TOKENS LOADING FIX ---
 def load_tokens():
     try:
-        if not os.path.exists("tokens.json"):
-            return None
         with open("tokens.json", "r") as f:
-            data = json.load(f)
-        
-        valid_tokens = []
-        for item in data:
-            # Yeh line check karegi ki token kisi bhi name se ho (token, eat_token, access_token)
-            t = item.get('token') or item.get('eat_token') or item.get('access_token')
-            if t:
-                valid_tokens.append(t)
-        return valid_tokens
+            tokens = json.load(f)
+        return tokens
     except Exception as e:
         app.logger.error(f"Error loading tokens: {e}")
         return None
@@ -44,6 +33,7 @@ def encrypt_message(plaintext):
         encrypted_message = cipher.encrypt(padded_message)
         return binascii.hexlify(encrypted_message).decode('utf-8')
     except Exception as e:
+        app.logger.error(f"Error encrypting message: {e}")
         return None
 
 def create_protobuf_message(user_id, region):
@@ -53,45 +43,74 @@ def create_protobuf_message(user_id, region):
         message.region = region
         return message.SerializeToString()
     except Exception as e:
+        app.logger.error(f"Error creating protobuf message: {e}")
         return None
 
-async def send_request(encrypted_uid, token, url, session):
+async def send_request(encrypted_uid, token, url):
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
             'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
             'Authorization': f"Bearer {token}",
             'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
             'ReleaseVersion': "OB52"
         }
-        async with session.post(url, data=edata, headers=headers, timeout=10) as response:
-            return response.status
-    except:
-        return None
-
-async def send_multiple_requests(uid, server_name, url, tokens):
-    try:
-        protobuf_message = create_protobuf_message(uid, server_name)
-        encrypted_uid = encrypt_message(protobuf_message)
-        if not encrypted_uid: return None
-        
         async with aiohttp.ClientSession() as session:
-            tasks = []
-            # Sirf pehle 100 tokens use karein Vercel stability ke liye
-            for token in tokens[:100]:
-                tasks.append(send_request(encrypted_uid, token, url, session))
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return results
+            async with session.post(url, data=edata, headers=headers) as response:
+                if response.status != 200:
+                    app.logger.error(f"Request failed with status code: {response.status}")
+                    return response.status
+                return await response.text()
     except Exception as e:
+        app.logger.error(f"Exception in send_request: {e}")
         return None
 
-def enc(uid):
+async def send_multiple_requests(uid, server_name, url):
+    try:
+        region = server_name
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            app.logger.error("Failed to create protobuf message.")
+            return None
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            app.logger.error("Encryption failed.")
+            return None
+        tasks = []
+        tokens = load_tokens()
+        if tokens is None:
+            app.logger.error("Failed to load tokens.")
+            return None
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
+            tasks.append(send_request(encrypted_uid, token, url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    except Exception as e:
+        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        return None
+
+def create_protobuf(uid):
     try:
         message = uid_generator_pb2.uid_generator()
         message.saturn_ = int(uid)
         message.garena = 1
-        return encrypt_message(message.SerializeToString())
-    except: return None
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+def enc(uid):
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        return None
+    encrypted_uid = encrypt_message(protobuf_data)
+    return encrypted_uid
 
 def make_request(encrypt, server_name, token):
     try:
@@ -101,17 +120,27 @@ def make_request(encrypt, server_name, token):
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
             url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
-            
         edata = bytes.fromhex(encrypt)
         headers = {
             'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
             'Authorization': f"Bearer {token}",
             'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
             'ReleaseVersion': "OB52"
         }
-        response = requests.post(url, data=edata, headers=headers, timeout=15)
-        return decode_protobuf(response.content)
-    except:
+        response = requests.post(url, data=edata, headers=headers, verify=False)
+        hex_data = response.content.hex()
+        binary = bytes.fromhex(hex_data)
+        decode = decode_protobuf(binary)
+        if decode is None:
+            app.logger.error("Protobuf decoding returned None.")
+        return decode
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
         return None
 
 def decode_protobuf(binary):
@@ -119,12 +148,23 @@ def decode_protobuf(binary):
         items = like_count_pb2.Info()
         items.ParseFromString(binary)
         return items
-    except:
+    except DecodeError as e:
+        app.logger.error(f"Error decoding Protobuf data: {e}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
         return None
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"status": "API is Running", "dev": "@riyan444"})
+    return jsonify({
+        "credit": "https://t.me/paglu_dev",
+        "message": "Welcome to the Free Fire Like API",
+        "status": "API is running",
+        "endpoints": "/like?uid=<uid> or /like?uid=<uid>&server_name=<server_name>",
+        "example": "/like?uid=123456789 or /like?uid=123456789&server_name=bd"
+})
+
 
 @app.route('/like', methods=['GET'])
 def handle_requests():
@@ -134,27 +174,39 @@ def handle_requests():
 
     try:
         tokens = load_tokens()
-        if not tokens:
-            return jsonify({"error": "No valid tokens found in tokens.json"}), 500
+        if tokens is None or not tokens:
+            return jsonify({"error": "Failed to load tokens."}), 500
+        token = tokens[0]['token']
         
-        # Use first token for info check
-        main_token = tokens[0]
-        server_name = request.args.get("server_name", "IND").upper()
+        # Extract server_name (lock_region) from token if not provided
+        server_name = request.args.get("server_name", "").upper()
+        if not server_name:
+            try:
+                payload = token.split('.')[1]
+                payload += '=' * (-len(payload) % 4)
+                decoded_payload = base64.urlsafe_b64decode(payload).decode('utf-8')
+                parsed_payload = json.loads(decoded_payload)
+                server_name = parsed_payload.get('lock_region', '').upper()
+            except Exception as e:
+                app.logger.error(f"Error decoding token payload: {e}")
+        
+        if not server_name:
+            return jsonify({"error": "server_name could not be determined from token or input"}), 400
         
         encrypted_uid = enc(uid)
-        if not encrypted_uid:
-            return jsonify({"error": "Encryption failed"}), 500
+        if encrypted_uid is None:
+            return jsonify({"error": "Encryption of UID failed."}), 500
 
-        # 1. Get before likes
-        before = make_request(encrypted_uid, server_name, main_token)
+        # Get before likes count
+        before = make_request(encrypted_uid, server_name, token)
         if before is None:
-            return jsonify({"error": "Invalid tokens or player not found"}), 500
+            return jsonify({"error": "Failed to retrieve player info. There are no valid token found! please update tokens.json with valid tokens"}), 500
         
         data_before = json.loads(MessageToJson(before))
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0) or 0)
-        player_name = str(data_before.get('AccountInfo', {}).get('PlayerNickname', 'Unknown'))
+        app.logger.info(f"Likes before: {before_like}")
 
-        # 2. Determine Like URL
+        # Determine URL based on server
         if server_name == "IND":
             url = "https://client.ind.freefiremobile.com/LikeProfile"
         elif server_name in {"BR", "US", "SAC", "NA"}:
@@ -162,29 +214,36 @@ def handle_requests():
         else:
             url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
-        # 3. Send likes asynchronously
-        asyncio.run(send_multiple_requests(uid, server_name, url, tokens))
+        # Send like requests
+        requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url))
+        app.logger.info(f"Requests sent: {requests_sent}")
 
-        # 4. Get after likes
-        after = make_request(encrypted_uid, server_name, main_token)
-        after_like = before_like # Default
-        if after:
-            data_after = json.loads(MessageToJson(after))
-            after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0) or 0)
-
+        # Get after likes count
+        after = make_request(encrypted_uid, server_name, token)
+        if after is None:
+            return jsonify({"error": "Failed to retrieve player info after likes."}), 500
+        
+        data_after = json.loads(MessageToJson(after))
+        account_info = data_after.get('AccountInfo', {})
+        after_like = int(account_info.get('Likes', 0) or 0)
+        player_uid = int(account_info.get('UID', 0) or 0)
+        player_name = str(account_info.get('PlayerNickname', ''))
+        
         like_given = after_like - before_like
         
         return jsonify({
-            "LikesGivenByAPI": like_given if like_given > 0 else len(tokens[:100]),
-            "LikesafterCommand": after_like if after_like > before_like else before_like + len(tokens[:100]),
+            "credit": "https://t.me/paglu_dev",
+            "LikesGivenByAPI": like_given,
+            "LikesafterCommand": after_like,
             "LikesbeforeCommand": before_like,
             "PlayerNickname": player_name,
             "Region": server_name,
-            "UID": int(uid),
-            "status": 1
+            "UID": player_uid,
+            "status": 1 if like_given > 0 else 2
         })
     except Exception as e:
+        app.logger.error(f"Error processing request: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)

@@ -3,6 +3,6 @@ requests
 aiohttp
 googleapis-common-protos
 pycryptodome
-protobuf
+protobuf==4.21.12
 Werkzeug
 gunicorn==21.2.0
